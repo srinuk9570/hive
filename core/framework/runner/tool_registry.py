@@ -4,6 +4,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -165,8 +166,11 @@ class ToolRegistry:
 
                     self.register(name, tool, make_executor(name))
                 else:
-                    # Register tool without executor (will use mock)
-                    self.register(name, tool, lambda inputs: {"mock": True, "inputs": inputs})
+                    self.register(
+                        name,
+                        tool,
+                        lambda inputs: {"mock": True, "inputs": inputs},
+                    )
                 count += 1
 
         # Check for @tool decorated functions
@@ -188,38 +192,60 @@ class ToolRegistry:
         return {name: rt.tool for name, rt in self._tools.items()}
 
     def get_executor(self) -> Callable[[ToolUse], ToolResult]:
-        """
+      """
         Get unified tool executor function.
 
         Returns a function that dispatches to the appropriate tool executor.
-        """
+       """
 
-        def executor(tool_use: ToolUse) -> ToolResult:
-            if tool_use.name not in self._tools:
-                return ToolResult(
-                    tool_use_id=tool_use.id,
-                    content=json.dumps({"error": f"Unknown tool: {tool_use.name}"}),
-                    is_error=True,
-                )
+      def executor(tool_use: ToolUse) -> ToolResult:
+        if tool_use.name not in self._tools:
+            return ToolResult(
+                tool_use_id=tool_use.id,
+                content=json.dumps({"error": f"Unknown tool: {tool_use.name}"}),
+                is_error=True,
+            )
 
-            registered = self._tools[tool_use.name]
-            try:
-                result = registered.executor(tool_use.input)
-                if isinstance(result, ToolResult):
-                    return result
-                return ToolResult(
-                    tool_use_id=tool_use.id,
-                    content=json.dumps(result) if not isinstance(result, str) else result,
-                    is_error=False,
-                )
-            except Exception as e:
-                return ToolResult(
-                    tool_use_id=tool_use.id,
-                    content=json.dumps({"error": str(e)}),
-                    is_error=True,
-                )
+        registered = self._tools[tool_use.name]
 
-        return executor
+        try:
+            result = registered.executor(tool_use.input)
+
+            if isinstance(result, ToolResult):
+                return result
+
+            return ToolResult(
+                tool_use_id=tool_use.id,
+                content=json.dumps(result) if not isinstance(result, str) else result,
+                is_error=False,
+            )
+
+        except Exception as e:
+            logger.error(
+                "Tool execution failed",
+                extra={
+                    "tool_name": tool_use.name,
+                    "tool_use_id": tool_use.id,
+                    "inputs": tool_use.input,
+                    "exception": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+
+            return ToolResult(
+                tool_use_id=tool_use.id,
+                content=json.dumps(
+                    {
+                        "error": f"Tool '{tool_use.name}' failed. "
+                        "Check logs for detailed traceback."
+                    }
+                ),
+                is_error=True,
+            )
+
+      return executor
+
+
 
     def get_registered_names(self) -> list[str]:
         """Get list of registered tool names."""
@@ -290,21 +316,32 @@ class ToolRegistry:
                 tool = self._convert_mcp_tool_to_framework_tool(mcp_tool)
 
                 # Create executor that calls the MCP server
-                def make_mcp_executor(client_ref: MCPClient, tool_name: str, registry_ref):
+                def make_mcp_executor(client_ref, tool_name, registry_ref):
                     def executor(inputs: dict) -> Any:
                         try:
-                            # Inject session context for tools that need it
-                            merged_inputs = {**registry_ref._session_context, **inputs}
-                            result = client_ref.call_tool(tool_name, merged_inputs)
-                            # MCP tools return content array, extract the result
-                            if isinstance(result, list) and len(result) > 0:
+                            merged_inputs = {
+                                **registry_ref._session_context,
+                                **inputs,
+                            }
+                            result = client_ref.call_tool(
+                                tool_name, merged_inputs
+                            )
+                            if isinstance(result, list) and result:
                                 if isinstance(result[0], dict) and "text" in result[0]:
                                     return result[0]["text"]
                                 return result[0]
                             return result
                         except Exception as e:
-                            logger.error(f"MCP tool '{tool_name}' execution failed: {e}")
-                            return {"error": str(e)}
+                            logger.error(
+                                "MCP tool execution failed",
+                                extra={
+                                    "tool_name": tool_name,
+                                    "inputs": inputs,
+                                    "exception": str(e),
+                                    "traceback": traceback.format_exc(),
+                                },
+                            )
+                            raise
 
                     return executor
 
@@ -315,11 +352,20 @@ class ToolRegistry:
                 )
                 count += 1
 
-            logger.info(f"Registered {count} tools from MCP server '{config.name}'")
+            logger.info(
+                f"Registered {count} tools from MCP server '{config.name}'"
+            )
             return count
 
         except Exception as e:
-            logger.error(f"Failed to register MCP server: {e}")
+            logger.error(
+                "Failed to register MCP server",
+                extra={
+                    "server_config": server_config,
+                    "exception": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
             return 0
 
     def _convert_mcp_tool_to_framework_tool(self, mcp_tool: Any) -> Tool:
